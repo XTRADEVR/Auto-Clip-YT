@@ -1,0 +1,2 @@
+fmpeg
+fonts-dejavu-core
