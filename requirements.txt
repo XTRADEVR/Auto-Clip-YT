@@ -1,0 +1,6 @@
+opencv-python-headless>=4.8,<5
+streamlit>=1.32
+yt-dlp>=2025.1.1
+requests>=2.31
+# Opsional: transkrip lokal bila video tidak punya subtitle
+# faster-whisper>=1.0
