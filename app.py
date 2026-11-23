@@ -1,44 +1,107 @@
-"""AutoClip AI - versi Streamlit (face tracking + subtitle karaoke).
+"""AutoClip AI - Streamlit.
 
-Tempel link YouTube -> unduh -> transkrip per kata -> Gemini memilih momen terbaik
+Link YouTube (atau upload video) -> transkrip -> Gemini memilih momen terbaik
 -> crop 9:16 mengikuti wajah -> subtitle karaoke -> klip siap upload.
-Jalankan: streamlit run streamlit_app.py
+
+File utama di Streamlit Cloud: app.py
 """
+import base64
+import importlib
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 import requests
 import streamlit as st
-import yt_dlp
-
-try:
-    import cv2  # opsional, untuk face tracking
-
-    HAS_CV2 = True
-except ImportError:
-    cv2 = None
-    HAS_CV2 = False
 
 st.set_page_config(page_title="AutoClip AI", page_icon="🎬", layout="wide")
 
+try:
+    import yt_dlp
+except ImportError:
+    st.error("Paket yt-dlp belum terpasang. Pastikan requirements.txt berisi baris: yt-dlp[default]")
+    st.stop()
+
+
+# ------------------------------------------------- komponen opsional (runtime)
+# requirements.txt sengaja minimal supaya instalasi tidak gagal. Komponen berat/opsional
+# (JS runtime untuk YouTube, OpenCV untuk face tracking) dipasang di sini, dan bila gagal
+# aplikasi tetap jalan tanpa fitur tersebut.
+def get_cv2():
+    try:
+        import cv2
+
+        return cv2
+    except Exception:  # noqa: BLE001 - ImportError atau konflik versi numpy
+        return None
+
 
 def face_detection_ready() -> bool:
-    """True bila OpenCV terpasang DAN file cascade wajah tersedia (ada di OpenCV 4.x, tidak di 5.x)."""
-    if not HAS_CV2:
+    """True bila OpenCV ada DAN file cascade wajah tersedia (ada di OpenCV 4.x, tidak di 5.x)."""
+    cv2 = get_cv2()
+    if cv2 is None:
         return False
     try:
-        path = cv2.data.haarcascades + "haarcascade_frontalface_default.xml"
+        path = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
         return os.path.exists(path) and not cv2.CascadeClassifier(path).empty()
     except Exception:  # noqa: BLE001
         return False
 
 
-FACE_OK = face_detection_ready()
+def pip_install(package: str) -> bool:
+    """Pasang paket tanpa dependensi (supaya numpy/streamlit yang sedang jalan tidak terganggu)."""
+    cmds = [[sys.executable, "-m", "pip", "install", "--quiet", "--no-deps", package]]
+    uv = shutil.which("uv")
+    if uv:
+        cmds.append([uv, "pip", "install", "--quiet", "--no-deps", "--python", sys.executable, package])
+    for cmd in cmds:
+        try:
+            proc = subprocess.run(cmd, capture_output=True, text=True, timeout=400)
+            if proc.returncode == 0:
+                importlib.invalidate_caches()
+                return True
+        except Exception:  # noqa: BLE001
+            continue
+    return False
+
+
+def find_deno() -> Optional[str]:
+    found = shutil.which("deno")
+    if found:
+        return found
+    try:
+        import deno  # paket PyPI "deno" (biner Deno)
+
+        path = deno.find_deno_bin()
+        return path if path and os.path.exists(path) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+@st.cache_resource(show_spinner="Menyiapkan komponen tambahan (JS runtime & face tracking)...")
+def setup_extras() -> dict:
+    deno_path = find_deno()
+    if not deno_path and pip_install("deno"):
+        deno_path = find_deno()
+    if deno_path:  # yt-dlp otomatis memakai Deno bila ada di PATH
+        os.environ["PATH"] = os.path.dirname(deno_path) + os.pathsep + os.environ.get("PATH", "")
+
+    face = face_detection_ready()
+    if not face and get_cv2() is None and pip_install("opencv-python-headless<5"):
+        face = face_detection_ready()
+    return {"deno": deno_path, "face": face}
+
+
+def get_secret(name: str, default: str = "") -> str:
+    try:
+        return str(st.secrets.get(name, default))
+    except Exception:  # noqa: BLE001 - secrets.toml belum dibuat
+        return default
 
 
 # ------------------------------------------------------------------ download
@@ -58,6 +121,8 @@ def download(url: str, workdir: Path, cookies: Optional[Path], on_progress: Call
         "noplaylist": True,
         "quiet": True,
         "no_warnings": True,
+        "retries": 3,
+        "socket_timeout": 30,
         "progress_hooks": [hook],
     }
     if cookies:
@@ -73,7 +138,7 @@ def download(url: str, workdir: Path, cookies: Optional[Path], on_progress: Call
     try:
         with yt_dlp.YoutubeDL(with_subs) as ydl:
             info = ydl.extract_info(url, download=True)
-    except Exception:
+    except Exception:  # noqa: BLE001
         # Biasanya gagal karena subtitle (mis. HTTP 429) -> ulangi tanpa subtitle.
         with yt_dlp.YoutubeDL(base) as ydl:
             info = ydl.extract_info(url, download=True)
@@ -87,8 +152,40 @@ def download(url: str, workdir: Path, cookies: Optional[Path], on_progress: Call
     return video, (subs[0] if subs else None), info
 
 
+def explain_error(msg: str) -> str:
+    low = msg.lower()
+    if "not a bot" in low or "sign in to confirm" in low or "confirm you" in low:
+        return (
+            "YouTube menolak unduhan dari server ini (IP server cloud sering diblokir). "
+            "Solusi: unggah cookies.txt dari browser yang login YouTube di sidebar, atau pakai tab "
+            "'Upload video'."
+        )
+    if "429" in low or "too many requests" in low:
+        return "YouTube membatasi permintaan (HTTP 429). Tunggu beberapa menit lalu coba lagi, atau pakai cookies.txt."
+    if "requested format is not available" in low or "javascript" in low or "challenge" in low:
+        return (
+            "YouTube butuh JS runtime untuk membaca video ini dan komponen Deno belum aktif. "
+            "Klik 'Siapkan ulang komponen' di sidebar, atau pakai tab 'Upload video'."
+        )
+    if "private video" in low or "video unavailable" in low or "members-only" in low:
+        return "Video ini privat, dihapus, atau khusus member sehingga tidak bisa diunduh."
+    return "Gagal mengunduh video."
+
+
 # ----------------------------------------------------------------- transkrip
 # Struktur segmen: {"start", "end", "text", "words": [{"w", "start", "end"}]}
+def even_words(text: str, start: float, end: float) -> List[dict]:
+    toks = text.split()
+    if not toks:
+        return []
+    if end <= start:
+        end = start + max(1.5, len(toks) * 0.35)
+    step = (end - start) / len(toks)
+    return [
+        {"w": t, "start": start + i * step, "end": start + (i + 1) * step} for i, t in enumerate(toks)
+    ]
+
+
 def parse_json3(path: Path) -> List[dict]:
     data = json.loads(path.read_text(encoding="utf-8"))
     out = []
@@ -102,26 +199,89 @@ def parse_json3(path: Path) -> List[dict]:
         if not text:
             continue
 
-        words = []
         if any("tOffsetMs" in s for s in segs):  # subtitle otomatis: ada waktu per kata
+            words = []
             for s in segs:
                 w = s.get("utf8", "").strip()
                 if w:
                     words.append({"w": w, "start": ev_start + s.get("tOffsetMs", 0) / 1000})
+            for i, w in enumerate(words):
+                nxt = words[i + 1]["start"] if i + 1 < len(words) else ev_end
+                w["end"] = max(min(nxt, w["start"] + 1.2), w["start"] + 0.05)
         else:  # subtitle manual: bagi rata di sepanjang durasi
-            toks = text.split()
-            step = (ev_end - ev_start) / max(len(toks), 1)
-            words = [{"w": t, "start": ev_start + i * step} for i, t in enumerate(toks)]
-
-        for i, w in enumerate(words):
-            nxt = words[i + 1]["start"] if i + 1 < len(words) else ev_end
-            w["end"] = max(min(nxt, w["start"] + 1.2), w["start"] + 0.05)
+            words = even_words(text, ev_start, ev_end)
         out.append({"start": ev_start, "end": ev_end, "text": text, "words": words})
     return out
 
 
+def parse_ts(value) -> float:
+    """Terima 12.5, '12.5', '01:30', atau '1:02:03' -> detik."""
+    if isinstance(value, (int, float)):
+        return float(value)
+    try:
+        secs = 0.0
+        for part in str(value).strip().split(":"):
+            secs = secs * 60 + float(part)
+        return secs
+    except ValueError:
+        return 0.0
+
+
+def segments_from_items(items) -> List[dict]:
+    out = []
+    if not isinstance(items, list):
+        return out
+    for it in items:
+        try:
+            text = str(it["text"]).strip()
+            start, end = parse_ts(it["start"]), parse_ts(it["end"])
+        except (KeyError, TypeError):
+            continue
+        if not text:
+            continue
+        if end <= start:
+            end = start + max(1.5, len(text.split()) * 0.35)
+        out.append({"start": start, "end": end, "text": text, "words": even_words(text, start, end)})
+    return sorted(out, key=lambda s: s["start"])
+
+
+def transcribe_gemini(video: Path, workdir: Path, api_key: str, model: str) -> List[dict]:
+    """Transkrip lewat Gemini (audio dikirim langsung). Timestamp per segmen, kata dibagi rata."""
+    audio = workdir / "audio.mp3"
+    proc = subprocess.run(
+        ["ffmpeg", "-y", "-i", str(video.resolve()), "-vn", "-ac", "1", "-ar", "16000",
+         "-b:a", "32k", "-t", "3000", str(audio)],
+        capture_output=True, text=True,
+    )
+    if proc.returncode != 0 or not audio.exists():
+        raise RuntimeError("Gagal mengekstrak audio (video mungkin tanpa suara).")
+    if audio.stat().st_size > 14_000_000:
+        raise RuntimeError("Audio terlalu besar untuk dikirim ke Gemini.")
+
+    prompt = (
+        "Transkripsikan ucapan pada audio ini dalam bahasa aslinya. "
+        'Balas HANYA JSON array: [{"start": "MM:SS", "end": "MM:SS", "text": "..."}]. '
+        "Tiap segmen 2-6 detik, waktu dihitung dari awal audio. Jangan menulis apa pun di luar JSON."
+    )
+    resp = requests.post(
+        f"https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent",
+        params={"key": api_key},
+        json={
+            "contents": [{"parts": [
+                {"text": prompt},
+                {"inline_data": {"mime_type": "audio/mp3", "data": base64.b64encode(audio.read_bytes()).decode()}},
+            ]}],
+            "generationConfig": {"responseMimeType": "application/json", "temperature": 0.1},
+        },
+        timeout=300,
+    )
+    resp.raise_for_status()
+    text = resp.json()["candidates"][0]["content"]["parts"][0]["text"]
+    return segments_from_items(json.loads(text))
+
+
 def transcribe_whisper(video: Path) -> List[dict]:
-    """Fallback bila tidak ada subtitle. Butuh paket faster-whisper (opsional)."""
+    """Fallback lokal. Butuh paket faster-whisper (opsional, tidak ada di requirements)."""
     try:
         from faster_whisper import WhisperModel
     except ImportError:
@@ -139,11 +299,21 @@ def transcribe_whisper(video: Path) -> List[dict]:
     return out
 
 
-def get_transcript(video: Path, sub: Optional[Path]) -> List[dict]:
+def get_transcript(video: Path, sub: Optional[Path], workdir: Path, api_key: str, model: str) -> List[dict]:
     if sub:
-        transcript = parse_json3(sub)
-        if transcript:
-            return transcript
+        try:
+            transcript = parse_json3(sub)
+            if transcript:
+                return transcript
+        except Exception:  # noqa: BLE001
+            pass
+    if api_key:
+        try:
+            transcript = transcribe_gemini(video, workdir, api_key, model)
+            if transcript:
+                return transcript
+        except Exception as exc:  # noqa: BLE001
+            st.warning(f"Transkrip lewat Gemini gagal ({str(exc)[:150]}).")
     return transcribe_whisper(video)
 
 
@@ -172,8 +342,8 @@ def clean_highlights(items, duration: float, n: int, min_s: int, max_s: int) -> 
         return cleaned
     for it in items:
         try:
-            start, end = float(it["start"]), float(it["end"])
-        except (KeyError, TypeError, ValueError):
+            start, end = parse_ts(it["start"]), parse_ts(it["end"])
+        except (KeyError, TypeError):
             continue
         start = max(0.0, start)
         end = min(duration, end)
@@ -227,7 +397,7 @@ def find_highlights(transcript, duration, n, min_s, max_s, api_key, model) -> Li
         if items:
             return items
     except Exception as exc:  # noqa: BLE001
-        st.warning(f"Gemini gagal ({str(exc)[:120]}). Memakai pembagian otomatis.")
+        st.warning(f"Gemini gagal memilih momen ({str(exc)[:120]}). Memakai pembagian otomatis.")
     return fallback_highlights(duration, n, min_s, max_s)
 
 
@@ -357,6 +527,20 @@ def probe_size(video: Path) -> Tuple[int, int]:
         raise RuntimeError("Resolusi video tidak terbaca (ffprobe).") from exc
 
 
+def probe_duration(video: Path) -> float:
+    proc = subprocess.run(
+        [
+            "ffprobe", "-v", "error", "-show_entries", "format=duration",
+            "-of", "default=noprint_wrappers=1:nokey=1", str(video.resolve()),
+        ],
+        capture_output=True, text=True,
+    )
+    try:
+        return float(proc.stdout.strip().split("\n")[0])
+    except (ValueError, IndexError):
+        return 0.0
+
+
 def face_knots(video: Path, start: float, end: float, crop_w: int, src_w: int,
                interval: float = 0.75) -> Optional[List[Tuple[float, int]]]:
     """Deteksi wajah tiap `interval` detik -> daftar titik (waktu, posisi x crop).
@@ -364,12 +548,13 @@ def face_knots(video: Path, start: float, end: float, crop_w: int, src_w: int,
     Posisi dihaluskan, dan titik baru hanya dibuat bila wajah bergeser cukup jauh,
     sehingga kamera tidak bergetar.
     """
-    if not HAS_CV2:
+    cv2 = get_cv2()
+    if cv2 is None:
         return None
     cap = cv2.VideoCapture(str(video))
     if not cap.isOpened():
         return None
-    cascade = cv2.CascadeClassifier(cv2.data.haarcascades + "haarcascade_frontalface_default.xml")
+    cascade = cv2.CascadeClassifier(os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml"))
     if cascade.empty():
         cap.release()
         return None
@@ -398,15 +583,13 @@ def face_knots(video: Path, start: float, end: float, crop_w: int, src_w: int,
     if not known:
         return None
 
-    # isi posisi yang kosong dengan posisi terakhir yang diketahui
-    last = known[0]
+    last = known[0]  # isi posisi kosong dengan posisi terakhir yang diketahui
     filled = []
     for c in centers:
         last = c if c is not None else last
         filled.append(last)
 
-    # haluskan (exponential smoothing)
-    smooth, cur = [], filled[0]
+    smooth, cur = [], filled[0]  # exponential smoothing
     for c in filled:
         cur = cur + 0.4 * (c - cur)
         smooth.append(cur)
@@ -495,101 +678,143 @@ def fmt_time(sec: float) -> str:
 
 
 # ------------------------------------------------------------------------ UI
+extras = setup_extras()
+
 st.title("🎬 AutoClip AI")
-st.caption("Tempel link YouTube. AI memilih momen terbaik lalu memotongnya jadi klip siap upload.")
+st.caption("Ubah video panjang jadi klip pendek siap upload: AI memilih momen terbaik, crop 9:16, subtitle karaoke.")
 
 with st.sidebar:
     st.header("Pengaturan")
 
-    default_key = os.getenv("GEMINI_API_KEY", "")
-    try:
-        default_key = st.secrets.get("GEMINI_API_KEY", default_key)
-    except Exception:  # secrets.toml belum dibuat
-        pass
-
+    default_key = get_secret("GEMINI_API_KEY", os.getenv("GEMINI_API_KEY", ""))
     api_key = st.text_input("Gemini API Key", value=default_key, type="password")
     model_name = st.text_input("Model Gemini", value="gemini-2.5-flash")
-    clip_count = st.slider("Jumlah klip", 1, 10, 5)
+    clip_count = st.slider("Jumlah klip", 1, 10, 3)
     min_s, max_s = st.slider("Durasi klip (detik)", 10, 180, (20, 60))
     vertical = st.checkbox("Format vertikal 9:16", value=True)
     face_track = st.checkbox(
         "Fokus ke wajah (face tracking)",
-        value=FACE_OK,
-        disabled=not (FACE_OK and vertical),
-        help="Crop 9:16 mengikuti wajah pembicara. Butuh opencv-python-headless 4.x dan format vertikal.",
+        value=extras["face"],
+        disabled=not (extras["face"] and vertical),
+        help="Crop 9:16 mengikuti wajah pembicara. Hanya untuk format vertikal.",
     )
-    if not FACE_OK:
-        st.caption("Face tracking nonaktif: pasang `opencv-python-headless>=4.8,<5` (OpenCV 5.x tidak menyertakan model wajah).")
     sub_mode = st.selectbox("Subtitle", ["Karaoke (per kata)", "Standar", "Tanpa subtitle"])
     cookies_file = st.file_uploader(
-        "cookies.txt (opsional)",
+        "cookies.txt YouTube (opsional)",
         type=["txt"],
-        help="Isi bila YouTube menolak unduhan dengan pesan 'Sign in to confirm you're not a bot'.",
+        help="Isi bila YouTube menolak unduhan ('Sign in to confirm you're not a bot'). "
+             "Bisa juga disimpan permanen di Secrets sebagai YOUTUBE_COOKIES.",
     )
-    if not api_key:
-        st.info("Tanpa API key, klip hanya dibagi rata (tidak dipilih AI).")
 
-url = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
-run = st.button("Buat Klip", type="primary")
+    st.divider()
+    st.caption("Status komponen")
+    st.caption(("✅" if extras["deno"] else "⚠️") + " JS runtime YouTube (Deno)")
+    st.caption(("✅" if extras["face"] else "⚠️") + " Face tracking (OpenCV)")
+    st.caption(("✅" if api_key else "⚠️") + " Gemini API key")
+    if st.button("Siapkan ulang komponen"):
+        setup_extras.clear()
+        st.rerun()
 
-if run:
-    url = url.strip()
-    if not url.lower().startswith(("http://", "https://")) or not any(
-        d in url.lower() for d in ("youtube.com/", "youtu.be/")
-    ):
-        st.error("Masukkan link YouTube yang valid.")
-    elif min_s >= max_s:
-        st.error("Durasi minimum harus lebih kecil dari maksimum.")
-    elif shutil.which("ffmpeg") is None or shutil.which("ffprobe") is None:
-        st.error("FFmpeg tidak ditemukan. Pasang FFmpeg (di Streamlit Cloud: tambahkan packages.txt berisi 'ffmpeg').")
+
+def prepare_cookies(workdir: Path) -> Optional[Path]:
+    data = None
+    if cookies_file is not None:
+        data = cookies_file.getvalue()
     else:
-        st.session_state.pop("result", None)
-        workdir = Path(tempfile.mkdtemp(prefix="autoclip_"))
-        bar = st.progress(0.0, text="Memulai...")
+        secret = get_secret("YOUTUBE_COOKIES", "")
+        if secret:
+            data = secret.encode("utf-8")
+    if not data:
+        return None
+    path = workdir / "cookies.txt"
+    path.write_bytes(data)
+    return path
 
-        def update(frac: float, msg: str) -> None:
-            bar.progress(min(max(frac, 0.0), 1.0), text=msg)
 
-        try:
-            cookies_path = None
-            if cookies_file is not None:
-                cookies_path = workdir / "cookies.txt"
-                cookies_path.write_bytes(cookies_file.getvalue())
+def run_job(mode: str, url: str, upload) -> None:
+    st.session_state.pop("result", None)
+    workdir = Path(tempfile.mkdtemp(prefix="autoclip_"))
+    bar = st.progress(0.0, text="Memulai...")
 
+    def update(frac: float, msg: str) -> None:
+        bar.progress(min(max(frac, 0.0), 1.0), text=msg)
+
+    try:
+        if mode == "link":
             update(0.02, "Mengunduh video...")
             video, sub, info = download(
-                url, workdir, cookies_path, lambda p: update(0.02 + p * 0.28, "Mengunduh video...")
+                url, workdir, prepare_cookies(workdir), lambda p: update(0.02 + p * 0.28, "Mengunduh video...")
             )
+            title = info.get("title", "")
             duration = float(info.get("duration") or 0)
-            if duration <= 0:
-                raise RuntimeError("Durasi video tidak terbaca (mungkin siaran langsung).")
+        else:
+            update(0.02, "Menyimpan video...")
+            video = workdir / ("source" + (Path(upload.name).suffix.lower() or ".mp4"))
+            video.write_bytes(upload.getvalue())
+            sub, title = None, Path(upload.name).stem
+            duration = probe_duration(video)
+        if duration <= 0:
+            raise RuntimeError("Durasi video tidak terbaca (mungkin siaran langsung atau file rusak).")
 
-            update(0.32, "Mengambil transkrip...")
-            transcript = get_transcript(video, sub)
-            if not transcript:
-                st.warning("Transkrip tidak tersedia: klip dipilih tanpa AI dan tanpa subtitle.")
+        update(0.32, "Membuat transkrip...")
+        transcript = get_transcript(video, sub, workdir, api_key, model_name)
+        if not transcript:
+            st.warning("Transkrip tidak tersedia: klip dibagi rata dan tanpa subtitle. "
+                       "Isi Gemini API key agar transkrip dan pemilihan momen otomatis berjalan.")
 
-            update(0.45, "AI memilih momen terbaik...")
-            highlights = find_highlights(transcript, duration, clip_count, min_s, max_s, api_key, model_name)
+        update(0.45, "AI memilih momen terbaik...")
+        highlights = find_highlights(transcript, duration, clip_count, min_s, max_s, api_key, model_name)
 
-            clips = []
-            for i, h in enumerate(highlights, 1):
-                update(0.5 + 0.48 * (i - 1) / len(highlights), f"Memotong klip {i}/{len(highlights)}...")
-                path = cut_clip(video, transcript, h, workdir, i, vertical, sub_mode, face_track and vertical)
-                clips.append({**h, "data": path.read_bytes()})
+        clips = []
+        for i, h in enumerate(highlights, 1):
+            update(0.5 + 0.48 * (i - 1) / len(highlights), f"Memotong klip {i}/{len(highlights)}...")
+            path = cut_clip(video, transcript, h, workdir, i, vertical, sub_mode, face_track and vertical)
+            clips.append({**h, "data": path.read_bytes()})
 
-            update(1.0, "Selesai")
-            st.session_state["result"] = {
-                "title": info.get("title", ""),
-                "vertical": vertical,
-                "clips": clips,
-            }
-        except yt_dlp.utils.DownloadError as exc:
-            st.error(f"Gagal mengunduh video: {str(exc)[:400]}")
-        except Exception as exc:  # noqa: BLE001
-            st.error(f"Terjadi kesalahan: {str(exc)[:400]}")
-        finally:
-            shutil.rmtree(workdir, ignore_errors=True)
+        update(1.0, "Selesai")
+        st.session_state["result"] = {"title": title, "vertical": vertical, "clips": clips}
+    except yt_dlp.utils.DownloadError as exc:
+        st.error(explain_error(str(exc)))
+        with st.expander("Detail error"):
+            st.code(str(exc)[:1500])
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Terjadi kesalahan: {str(exc)[:400]}")
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+
+
+def ffmpeg_ok() -> bool:
+    if shutil.which("ffmpeg") and shutil.which("ffprobe"):
+        return True
+    st.error("FFmpeg tidak ditemukan. Di Streamlit Cloud, tambahkan file packages.txt berisi satu baris: ffmpeg")
+    return False
+
+
+tab_link, tab_file = st.tabs(["🔗 Link YouTube", "📁 Upload video"])
+
+with tab_link:
+    url = st.text_input("Link YouTube", placeholder="https://www.youtube.com/watch?v=...")
+    if st.button("Buat Klip dari Link", type="primary", key="run_link"):
+        u = url.strip()
+        if not u.lower().startswith(("http://", "https://")) or not any(
+            d in u.lower() for d in ("youtube.com/", "youtu.be/")
+        ):
+            st.error("Masukkan link YouTube yang valid.")
+        elif min_s >= max_s:
+            st.error("Durasi minimum harus lebih kecil dari maksimum.")
+        elif ffmpeg_ok():
+            run_job("link", u, None)
+    st.caption("Jika YouTube menolak unduhan dari server, unggah cookies.txt di sidebar atau pakai tab Upload video.")
+
+with tab_file:
+    upload = st.file_uploader("Video (mp4, mov, mkv, webm)", type=["mp4", "mov", "mkv", "webm", "m4v"])
+    if st.button("Buat Klip dari File", type="primary", key="run_file"):
+        if upload is None:
+            st.error("Pilih file video terlebih dahulu.")
+        elif min_s >= max_s:
+            st.error("Durasi minimum harus lebih kecil dari maksimum.")
+        elif ffmpeg_ok():
+            run_job("file", "", upload)
 
 result = st.session_state.get("result")
 if result:
